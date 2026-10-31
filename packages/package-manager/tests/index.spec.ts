@@ -35,6 +35,8 @@ interface Fixture {
   lockfile: string
   /** the protocols of a dependency on a local directory */
   localProtocols: string[]
+  /** whether the resolution fetches the tarballs, so that an abort while fetching leaves `node_modules` as it is */
+  fetchesInResolution?: boolean
 }
 
 const fixtures: Fixture[] = [{
@@ -64,14 +66,6 @@ const fixtures: Fixture[] = [{
   lockfile: 'pnpm-lock.yaml',
   localProtocols: ['file', 'link'],
 }, {
-  name: 'yarn classic',
-  packageManager: async () => 'yarn@1.22.19',
-  files: cache => ({
-    '.yarnrc': `registry "${registry.url}"\ncache-folder ${JSON.stringify(cache)}\n`,
-  }),
-  lockfile: 'yarn.lock',
-  localProtocols: ['file', 'link'],
-}, {
   name: 'yarn berry',
   packageManager: async () => 'yarn@4.14.1',
   files: cache => ({
@@ -90,6 +84,7 @@ const fixtures: Fixture[] = [{
   }),
   lockfile: 'yarn.lock',
   localProtocols: ['file', 'portal', 'link'],
+  fetchesInResolution: true,
 }]
 
 let counter = 0
@@ -237,12 +232,14 @@ describe.each(fixtures)('$name', (fixture) => {
     pm = await setup(dir)
     // a project has a lockfile before the service changes it
     const agent = await pm.agent()
-    await run(agent.executable, adapters[agent.kind].installArgs, { cwd: dir, env: createEnv() })
+    for (const args of [adapters[agent.name].resolveArgs, adapters[agent.name].installArgs]) {
+      await run(agent.executable, args, { cwd: dir, env: createEnv() })
+    }
   })
 
   it('detects the agent', async () => {
     const agent = await pm.agent()
-    expect(agent.kind).to.equal(fixture.name.replace(' ', '-'))
+    expect(agent.name).to.equal(fixture.name.split(' ')[0])
   })
 
   it('adds packages', async () => {
@@ -280,8 +277,19 @@ describe.each(fixtures)('$name', (fixture) => {
     const before = snapshot(dir, fixture.lockfile)
     const controller = new AbortController()
     let release!: () => void
-    registry.delay = (path) => {
+    const beta = join(dir, 'node_modules/beta')
+    const manifest = readFileSync(join(beta, 'package.json'))
+    registry.delay = async (path) => {
       if (!path.startsWith('epsilon/')) return
+      if (!fixture.fetchesInResolution) {
+        // The agent is removing `beta` while it fetches. It is terminated
+        // when the removal has left only the manifest, which the agent and
+        // its records still take for an installed package.
+        await vi.waitFor(() => expect(existsSync(join(beta, 'index.js'))).to.equal(false), { timeout: 2000 }).catch(() => {})
+        rmSync(beta, { recursive: true, force: true })
+        mkdirSync(beta, { recursive: true })
+        writeFileSync(join(beta, 'package.json'), manifest)
+      }
       controller.abort()
       return new Promise<void>(resolve => release = resolve)
     }
@@ -291,7 +299,10 @@ describe.each(fixtures)('$name', (fixture) => {
       registry.delay = undefined
       release?.()
     }
-    expectRestored(before, snapshot(dir, fixture.lockfile))
+    const after = snapshot(dir, fixture.lockfile)
+    expectRestored(before, after)
+    // an abort during the resolution leaves the packages and the records of the agent as they are
+    if (fixture.fetchesInResolution) expect(after.tree).to.deep.equal(before.tree)
   })
 
   it('reports changes against the restored state', async () => {
@@ -316,6 +327,14 @@ describe.each(fixtures)('$name', (fixture) => {
 })
 
 describe('preconditions', () => {
+  it('rejects yarn classic', async () => {
+    const manifest = JSON.stringify({ name: 'project', packageManager: 'yarn@1.22.19' })
+    const dir = createProject({ 'package.json': manifest, 'yarn.lock': '' })
+    const pm = await setup(dir)
+    await expect(pm.install({ alpha: '1.0.0' })).rejects.toThrow('yarn classic is not supported')
+    expect(readFileSync(join(dir, 'package.json'), 'utf8')).to.equal(manifest)
+  })
+
   it('rejects a project without a lockfile', async () => {
     const manifest = JSON.stringify({ name: 'project', packageManager: await fixtures[0].packageManager() })
     const dir = createProject({ 'package.json': manifest })
@@ -334,13 +353,9 @@ describe('preconditions', () => {
   it.each([
     ['npm with a linked strategy', fixtures[0], { '.npmrc': 'install-strategy=linked\n' }],
     ['pnpm with an isolated linker', fixtures[1], { 'pnpm-workspace.yaml': 'nodeLinker: isolated\n' }],
-    ['yarn classic with pnp in the manifest', fixtures[2], { 'yarn.lock': '' }, { installConfig: { pnp: true } }],
-    ['yarn classic with pnp in .yarnrc', fixtures[2], { '.yarnrc': '--install.pnp true\n', 'yarn.lock': '' }],
-    ['yarn classic with a modules folder', fixtures[2], { '.yarnrc': '--modules-folder lib\n', 'yarn.lock': '' }],
-    ['yarn classic with a meta folder', fixtures[2], { '.yarnrc': 'enable-meta-folder true\n', 'yarn.lock': '' }],
-    ['yarn berry with pnp', fixtures[3], { '.yarnrc.yml': 'nodeLinker: pnp\n', 'yarn.lock': '' }],
-  ] as [string, Fixture, Record<string, string>, object?][])('rejects %s', async (_, fixture, files, extra = {}) => {
-    const manifest = JSON.stringify({ name: 'project', packageManager: await fixture.packageManager(), ...extra })
+    ['yarn berry with pnp', fixtures[2], { '.yarnrc.yml': 'nodeLinker: pnp\n', 'yarn.lock': '' }],
+  ] as [string, Fixture, Record<string, string>][])('rejects %s', async (_, fixture, files) => {
+    const manifest = JSON.stringify({ name: 'project', packageManager: await fixture.packageManager() })
     const dir = createProject({ 'package.json': manifest, ...files })
     const pm = await setup(dir)
     await expect(pm.install({ alpha: '1.0.0' })).rejects.toThrow('only')

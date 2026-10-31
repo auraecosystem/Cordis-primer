@@ -75,16 +75,11 @@ export class Registry {
   async start() {
     await new Promise<void>(resolve => this.server.listen(0, '127.0.0.1', resolve))
     this.url = `http://127.0.0.1:${(this.server.address() as AddressInfo).port}/`
-    for (const [index, meta] of this.versions.entries()) {
+    for (const meta of this.versions) {
       const manifest = { ...meta, main: 'index.js' }
-      // Yarn classic skips copying a file whose size and mtime equal those of
-      // the existing one, and it stamps the files of a tarball with the time
-      // of extraction. Two versions extracted within the same millisecond
-      // would thus not replace each other, so every file differs in size.
-      const padding = ' '.repeat(index)
       const tarball = pack({
-        'package.json': JSON.stringify(manifest, null, 2) + padding,
-        'index.js': `module.exports = ${JSON.stringify(`${meta.name}@${meta.version}`)}\n${padding}`,
+        'package.json': JSON.stringify(manifest, null, 2),
+        'index.js': `module.exports = ${JSON.stringify(`${meta.name}@${meta.version}`)}\n`,
       })
       const path = `${meta.name}/-/${meta.name.split('/').pop()}-${meta.version}.tgz`
       this.tarballs.set(path, tarball)

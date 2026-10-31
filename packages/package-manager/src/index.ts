@@ -1,6 +1,6 @@
 import { Context, Service } from 'cordis'
 import { existsSync } from 'node:fs'
-import { readFile, writeFile } from 'node:fs/promises'
+import { readFile, rm, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import z from 'schemastery'
@@ -8,7 +8,7 @@ import { adapters, AgentInfo, detectAgent } from './agent.ts'
 import { applyChanges, DependencyChanges, normalizeChanges, stringifyManifest } from './manifest.ts'
 import { createEnv, run } from './process.ts'
 import { FileBackup } from './backup.ts'
-import { diffState, realpath, StateDiff } from './state.ts'
+import { diffState, findAddedLocations, realpath, StateDiff } from './state.ts'
 
 export type * from './agent.ts'
 export type * from './manifest.ts'
@@ -59,8 +59,9 @@ class PackageManager extends Service {
     const root = this.root
     const env = createEnv()
     const agent = await detectAgent(root, env)
-    const adapter = adapters[agent.kind]
-    if (!adapter.lockfiles.some(file => existsSync(resolve(root, file)))) {
+    const adapter = adapters[agent.name]
+    const lockfile = adapter.lockfiles.find(file => existsSync(resolve(root, file)))
+    if (!lockfile) {
       throw new Error(`${root} has no lockfile, expected ${adapter.lockfiles.join(' or ')}`)
     }
 
@@ -68,6 +69,7 @@ class PackageManager extends Service {
     const original = await readFile(manifestPath, 'utf8')
     const manifest = JSON.parse(original)
     const before = await adapter.readState(root)
+    const previous = await readFile(resolve(root, lockfile), 'utf8')
     const backup = await FileBackup.create(['package.json', ...adapter.lockfiles, ...adapter.restoredFiles].map(file => resolve(root, file)))
     options.signal?.throwIfAborted()
 
@@ -75,22 +77,48 @@ class PackageManager extends Service {
       cwd: root,
       env,
       timeout: this.config.timeout,
+      signal: options.signal,
       onOutput: (chunk: string) => this.ctx.logger.debug(chunk.trimEnd()),
     }
+
+    // The resolution leaves the packages as they are, so that its failure
+    // only requires the files to be restored.
+    let planned: Set<string>
     try {
       await writeFile(manifestPath, stringifyManifest(applyChanges(manifest, changes), original))
-      await run(agent.executable, adapter.installArgs, { ...runOptions, signal: options.signal })
-      return { agent, ...diffState(root, before, await adapter.readState(root)) }
+      await run(agent.executable, adapter.resolveArgs, runOptions)
+      planned = await adapter.planChanges(root, before, previous)
     } catch (error) {
       try {
         await backup.restore()
+      } catch (restoreError) {
+        throw new AggregateError([error, restoreError], 'resolution failed, and the project files could not be restored')
+      }
+      throw error
+    }
+
+    try {
+      await run(agent.executable, adapter.installArgs, runOptions)
+    } catch (error) {
+      try {
+        await backup.restore()
+        // The agent may have left a package partially written, which it
+        // takes for installed by its records or by the presence of its
+        // directory. Every location that the installation may have changed
+        // is removed, so that the recovery installs it again.
+        const locations = [...planned, ...await findAddedLocations(root, before, planned)].sort()
+        // one after another, so that a location is removed after its ancestors
+        for (const path of [...adapter.resetFiles, ...locations]) {
+          await rm(resolve(root, path), { recursive: true, force: true })
+        }
         // not cancellable, since it restores the state before the call
-        await run(agent.executable, adapter.recoverArgs, runOptions)
+        await run(agent.executable, adapter.recoverArgs, { ...runOptions, signal: undefined })
       } catch (recoverError) {
         throw new AggregateError([error, recoverError], 'installation failed, and node_modules could not be restored from the lockfile')
       }
       throw error
     }
+    return { agent, ...diffState(root, before, await adapter.readState(root)) }
   }
 }
 
